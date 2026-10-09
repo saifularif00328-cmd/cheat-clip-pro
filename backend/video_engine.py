@@ -3117,6 +3117,11 @@ def render_clip_to_mp4(
     else:
         out_audio_map = "0:a:0?"
 
+    if LOW_RAM:
+        # Low-spec PC: encode at 720p width to cut encoder/frame-buffer memory by ~55%.
+        filter_chains.append(f"{out_video_map}scale=720:-2[v_lowram]")
+        out_video_map = "[v_lowram]"
+
     final_filter_complex = ";".join(filter_chains)
 
     # Video encoder (resolved from user choice: auto, nvenc, amf, qsv, cpu)
