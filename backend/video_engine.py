@@ -288,7 +288,7 @@ ENCODER_CONFIGS: Dict[str, Tuple[str, List[str]]] = {
     "nvenc": ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"]),
     "amf": ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed", "-rc", "cbr", "-b:v", "6M"]),
     "qsv": ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", "-look_ahead", "0"]),
-    "cpu": ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2"]),
+    "cpu": ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2", "-rc-lookahead", "10"]),
 }
 
 _DETECTED_SUPPORT: Optional[Dict[str, Any]] = None
@@ -3141,7 +3141,7 @@ def render_clip_to_mp4(
                 "-filter_complex", final_filter_complex,
                 "-map", out_video_map,
                 "-map", out_audio_map,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2", "-rc-lookahead", "10",
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
@@ -3170,6 +3170,30 @@ def render_clip_to_mp4(
                     except Exception:
                         pass
                 err_text = res_cpu.stderr if (res_cpu and res_cpu.stderr) else (res.stderr if (res and res.stderr) else "Unknown FFmpeg error")
+                if "malloc" in err_text.lower() or "out of memory" in err_text.lower() or "cannot allocate" in err_text.lower():
+                    # Out of RAM: last-resort attempt with the smallest possible x264/filter memory footprint.
+                    logger.warning("x264 ran out of memory; retrying with low-memory settings (1 thread, no lookahead/B-frames, 1 ref)...")
+                    lowmem_cmd = list(cpu_cmd)
+                    idx_c = lowmem_cmd.index("-c:v")
+                    lowmem_cmd[idx_c:idx_c + 12] = [
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-threads", "1",
+                        "-rc-lookahead", "0", "-bf", "0", "-refs", "1",
+                    ]
+                    lowmem_cmd[1:1] = ["-filter_threads", "1", "-filter_complex_threads", "1"]
+                    try:
+                        res_low = subprocess.run(lowmem_cmd, capture_output=True, text=True, timeout=cpu_render_timeout)
+                        if res_low.returncode == 0 and os.path.exists(output_mp4_path) and is_valid_mp4(output_mp4_path):
+                            logger.info(f"Successfully rendered with low-memory fallback: {output_mp4_path}")
+                            return str(output_mp4_path)
+                        err_text = res_low.stderr or err_text
+                    except subprocess.TimeoutExpired:
+                        err_text = f"Low-memory render timed out after {cpu_render_timeout}s. Original error: {err_text}"
+                    if os.path.exists(output_mp4_path):
+                        try:
+                            os.unlink(output_mp4_path)
+                        except Exception:
+                            pass
+                    raise RuntimeError("FFmpeg rendering failed: not enough free RAM. Close other apps/browser tabs, use a shorter clip, or pick the GPU encoder (NVENC/AMF/QSV) in Studio Settings. Details: " + err_text[:300])
                 if "moov atom not found" in err_text.lower():
                     raise RuntimeError("FFmpeg rendering failed: Source video segment is incomplete ('moov atom not found'). Please retry rendering this clip.")
                 logger.error(f"FFmpeg CPU fallback also failed: {err_text}")
