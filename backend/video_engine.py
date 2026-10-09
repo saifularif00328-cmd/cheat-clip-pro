@@ -278,7 +278,7 @@ def check_encoder_support(encoder_name: str) -> bool:
             "-f", "lavfi", "-i", "color=c=black:s=1080x1920:d=0.2",
             "-c:v", encoder_name, "-f", "null", "-"
         ]
-        res = subprocess.run(cmd, capture_output=True, timeout=5)
+        res = subprocess.run(cmd, capture_output=True, timeout=20)  # slow CPUs (e.g. Celeron) need more than 5s to init QSV
         return res.returncode == 0
     except Exception:
         return False
@@ -290,6 +290,34 @@ ENCODER_CONFIGS: Dict[str, Tuple[str, List[str]]] = {
     "qsv": ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", "-look_ahead", "0"]),
     "cpu": ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2", "-rc-lookahead", "10"]),
 }
+
+def get_total_ram_gb() -> float:
+    """Total physical RAM in GB (0.0 if unknown). No third-party dependency."""
+    try:
+        import ctypes
+        if os.name == "nt":
+            class _MEM(ctypes.Structure):
+                _fields_ = [("l", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                            ("avail", ctypes.c_ulonglong), ("tp", ctypes.c_ulonglong), ("ap", ctypes.c_ulonglong),
+                            ("tv", ctypes.c_ulonglong), ("av", ctypes.c_ulonglong), ("ave", ctypes.c_ulonglong)]
+            m = _MEM()
+            m.l = ctypes.sizeof(_MEM)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+            return m.total / (1024 ** 3)
+        with open("/proc/meminfo") as f:
+            return int(f.readline().split()[1]) / (1024 ** 2)
+    except Exception:
+        return 0.0
+
+
+LOW_RAM = 0.0 < get_total_ram_gb() <= 4.5
+
+if LOW_RAM:
+    # Low-spec PCs (e.g. 2GB RAM Celeron): minimize encoder memory footprint.
+    ENCODER_CONFIGS["cpu"] = ("libx264", ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-threads", "1",
+                                          "-rc-lookahead", "0", "-bf", "0", "-refs", "1"])
+    ENCODER_CONFIGS["qsv"] = ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "26",
+                                           "-look_ahead", "0", "-async_depth", "1", "-bf", "0"])
 
 _DETECTED_SUPPORT: Optional[Dict[str, Any]] = None
 
@@ -3141,7 +3169,7 @@ def render_clip_to_mp4(
                 "-filter_complex", final_filter_complex,
                 "-map", out_video_map,
                 "-map", out_audio_map,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-threads", "2", "-rc-lookahead", "10",
+                *ENCODER_CONFIGS["cpu"][1],
                 "-c:a", "aac", "-b:a", "192k",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
@@ -3175,7 +3203,7 @@ def render_clip_to_mp4(
                     logger.warning("x264 ran out of memory; retrying with low-memory settings (1 thread, no lookahead/B-frames, 1 ref)...")
                     lowmem_cmd = list(cpu_cmd)
                     idx_c = lowmem_cmd.index("-c:v")
-                    lowmem_cmd[idx_c:idx_c + 12] = [
+                    lowmem_cmd[idx_c:idx_c + len(ENCODER_CONFIGS["cpu"][1])] = [
                         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-threads", "1",
                         "-rc-lookahead", "0", "-bf", "0", "-refs", "1",
                     ]
